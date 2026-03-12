@@ -1,0 +1,10 @@
+*.tmp
+*.temp
+*.log
+*.bin
+*.hex
+*.elf
+*.map
+*.zip
+.DS_Store
+Thumbs.db
