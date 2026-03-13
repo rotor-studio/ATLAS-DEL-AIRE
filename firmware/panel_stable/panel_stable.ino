@@ -12,7 +12,8 @@
 #define DRD_TIMEOUT 2
 #define DRD_ADDRESS 0
 #define EEPROM_SIZE 512
-#define HTTP_TIMEOUT_MS 15000
+#define HTTP_TIMEOUT_MS 20000
+#define HTTP_MAX_RETRIES 3
 #define CONFIG_EEPROM_START 4
 
 struct SensorResult {
@@ -33,15 +34,15 @@ unsigned long lastScroll = 0;
 const int scrollDelay = 150;
 bool newDataReceived = false;
 
-char sensorID1[20] = "89784";
-char sensorID2[20] = "89785";
+char sensorID1[20] = "";
+char sensorID2[20] = "";
 char customText[30] = "Texto personalizado";
 char intervalChar[6] = "600";
 unsigned long previousMillis = 0;
 unsigned long interval = 600000;
 
-SensorResult result1 = {"Sin datos", matrix.Color(255, 255, 0)};
-SensorResult result2 = {"Sin datos", matrix.Color(255, 255, 0)};
+SensorResult result1 = {"", matrix.Color(255, 255, 255)};
+SensorResult result2 = {"", matrix.Color(255, 255, 255)};
 
 WiFiManager wifiManager;
 
@@ -82,6 +83,10 @@ void sanitizeCharBuffer(char* buffer, size_t size, const char* fallback) {
   }
 }
 
+bool isSensorConfigured(const char* sensorID) {
+  return sensorID != nullptr && strlen(sensorID) > 0;
+}
+
 String wifiStatusToString(wl_status_t status) {
   switch (status) {
     case WL_IDLE_STATUS: return "WL_IDLE_STATUS";
@@ -118,8 +123,8 @@ void loadConfigFromEEPROM() {
   EEPROM.get(CONFIG_EEPROM_START + 60, customText);
   EEPROM.end();
 
-  sanitizeCharBuffer(sensorID1, sizeof(sensorID1), "89784");
-  sanitizeCharBuffer(sensorID2, sizeof(sensorID2), "89785");
+  sanitizeCharBuffer(sensorID1, sizeof(sensorID1), "");
+  sanitizeCharBuffer(sensorID2, sizeof(sensorID2), "");
   sanitizeCharBuffer(intervalChar, sizeof(intervalChar), "600");
   sanitizeCharBuffer(customText, sizeof(customText), "Texto personalizado");
 
@@ -190,6 +195,12 @@ public:
 SensorResult fetchData(const String& sensorID) {
   SensorResult result = {"Sin datos", matrix.Color(255, 255, 0)};
 
+  if (sensorID.length() == 0) {
+    result.text = "";
+    result.color = matrix.Color(255, 255, 255);
+    return result;
+  }
+
   if (WiFi.status() != WL_CONNECTED) {
     logLine("WiFi no conectado, no se puede consultar el sensor " + sensorID);
     result.text = "No conectado";
@@ -199,37 +210,63 @@ SensorResult fetchData(const String& sensorID) {
   logValue("Consultando sensor", sensorID);
   logValue("Heap antes de request", String(ESP.getFreeHeap()));
 
-  WiFiClientSecure localClient;
-  localClient.setInsecure();
-  localClient.setTimeout(HTTP_TIMEOUT_MS);
+  const char* host = "data.sensor.community";
+  String uri = "/airrohr/v1/sensor/" + sensorID + "/";
+  String payload = "";
 
-  HTTPClient http;
-  http.setTimeout(HTTP_TIMEOUT_MS);
-  http.setReuse(false);
+  for (int attempt = 1; attempt <= HTTP_MAX_RETRIES; attempt++) {
+    logValue("HTTP intento", String(attempt));
 
-  String url = "https://data.sensor.community/airrohr/v1/sensor/" + sensorID + "/";
-  if (!http.begin(localClient, url)) {
-    logLine("http.begin() fallo para " + sensorID);
-    result.text = "HTTP Begin Error";
-    return result;
-  }
+    WiFiClientSecure localClient;
+    localClient.setInsecure();
+    localClient.setTimeout(HTTP_TIMEOUT_MS);
+    localClient.setBufferSizes(512, 512);
 
-  int httpCode = http.GET();
-  logValue("HTTP code", String(httpCode));
+    HTTPClient http;
+    http.setTimeout(HTTP_TIMEOUT_MS);
+    http.setReuse(false);
+    http.useHTTP10(true);
 
-  if (httpCode != HTTP_CODE_OK) {
+    if (!http.begin(localClient, host, 443, uri, true)) {
+      logLine("http.begin() fallo para " + sensorID);
+      result.text = "HTTP Begin Error";
+      delay(1200);
+      yield();
+      continue;
+    }
+
+    int httpCode = http.GET();
+    logValue("HTTP code", String(httpCode));
+
+    if (httpCode == HTTP_CODE_OK) {
+      payload = http.getString();
+      http.end();
+      break;
+    }
+
     logValue("HTTP error", http.errorToString(httpCode));
-    result.text = "HTTP Error";
+    logValue("WiFi status", wifiStatusToString(WiFi.status()));
+    logValue("IP", WiFi.localIP().toString());
+    logValue("RSSI", String(WiFi.RSSI()));
     http.end();
-    return result;
-  }
 
-  String payload = http.getString();
-  http.end();
+    result.text = "HTTP Error";
+    if (httpCode < 0) {
+      WiFi.disconnect(false);
+      delay(500);
+      WiFi.reconnect();
+      delay(2000);
+      yield();
+    }
+    delay(1500);
+    yield();
+  }
 
   if (payload.length() == 0) {
-    logLine("Payload vacio para sensor " + sensorID);
-    result.text = "Payload vacio";
+    logLine("Payload vacio o request fallida para sensor " + sensorID);
+    if (result.text.length() == 0 || result.text == "Sin datos") {
+      result.text = "HTTP Error";
+    }
     return result;
   }
 
@@ -331,11 +368,21 @@ SensorResult fetchData(const String& sensorID) {
 void performSensorUpdate() {
   logLine("Iniciando actualizacion de sensores");
   result1 = fetchData(sensorID1);
-  delay(1000);
-  yield();
-  result2 = fetchData(sensorID2);
+  result2 = {"", matrix.Color(255, 255, 255)};
 
-  displayText = String(customText) + " - " + result1.text + " - " + result2.text;
+  if (isSensorConfigured(sensorID2)) {
+    delay(1000);
+    yield();
+    result2 = fetchData(sensorID2);
+  }
+
+  displayText = String(customText);
+  if (result1.text.length() > 0) {
+    displayText += " - " + result1.text;
+  }
+  if (result2.text.length() > 0) {
+    displayText += " - " + result2.text;
+  }
   newDataReceived = true;
 
   logValue("Display text", displayText);
@@ -355,9 +402,9 @@ void resetCustomParameters() {
 
   clearLEDPanel();
 
-  strncpy(sensorID1, "89784", sizeof(sensorID1) - 1);
+  strncpy(sensorID1, "", sizeof(sensorID1) - 1);
   sensorID1[sizeof(sensorID1) - 1] = '\0';
-  strncpy(sensorID2, "89785", sizeof(sensorID2) - 1);
+  strncpy(sensorID2, "", sizeof(sensorID2) - 1);
   sensorID2[sizeof(sensorID2) - 1] = '\0';
   strncpy(intervalChar, "600", sizeof(intervalChar) - 1);
   intervalChar[sizeof(intervalChar) - 1] = '\0';
@@ -419,8 +466,8 @@ void setup() {
   strncpy(intervalChar, custom_interval.getValue(), sizeof(intervalChar) - 1);
   intervalChar[sizeof(intervalChar) - 1] = '\0';
 
-  sanitizeCharBuffer(sensorID1, sizeof(sensorID1), "89784");
-  sanitizeCharBuffer(sensorID2, sizeof(sensorID2), "89785");
+  sanitizeCharBuffer(sensorID1, sizeof(sensorID1), "");
+  sanitizeCharBuffer(sensorID2, sizeof(sensorID2), "");
   sanitizeCharBuffer(intervalChar, sizeof(intervalChar), "600");
   sanitizeCharBuffer(customText, sizeof(customText), "Texto personalizado");
 
@@ -437,6 +484,8 @@ void setup() {
   logValue("Heap post WiFi", String(ESP.getFreeHeap()));
 
   if (WiFi.status() == WL_CONNECTED) {
+    WiFi.setSleepMode(WIFI_NONE_SLEEP);
+    WiFi.setAutoReconnect(true);
     displayText = "Conectado: " + WiFi.SSID();
     matrix.setTextColor(matrix.Color(0, 255, 0));
     newDataReceived = true;

@@ -8,3 +8,11 @@
 *.zip
 .DS_Store
 Thumbs.db
+node_modules/
+build/
+dist/
+__pycache__/
+*.spec
+serial_capture*.txt
+!firmware/releases/atlas-del-aire-latest.bin
+package-lock.json
